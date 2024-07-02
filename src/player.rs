@@ -10,6 +10,7 @@ use ringbuf::{
     HeapRb,
 };
 use std::{
+    fmt::Display,
     fs::{self, File},
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
@@ -18,11 +19,12 @@ use std::{
 };
 use symphonia::core::{
     audio::{AudioBuffer, Signal},
-    codecs::DecoderOptions,
-    formats::FormatOptions,
+    codecs::{CodecParameters, Decoder},
+    formats::{FormatOptions, FormatReader},
     io::{MediaSourceStream, MediaSourceStreamOptions},
     meta::MetadataOptions,
     probe::Hint,
+    units::{Time, TimeBase},
 };
 
 type SampleType = i16;
@@ -220,17 +222,19 @@ impl<T> Queue<T> {
 /// A representation of a song that can be played from `Player`.
 #[derive(Clone, Debug)]
 pub struct Song {
+    id: u32,
     title: String,
     path: PathBuf,
-    duration: Duration,
+    params: CodecParameters,
 }
 
 impl Song {
-    pub fn new(name: String, path: impl Into<PathBuf>, duration: Duration) -> Self {
+    pub fn new(id: u32, name: String, path: impl Into<PathBuf>, params: CodecParameters) -> Self {
         Self {
+            id,
             title: name,
             path: path.into(),
-            duration,
+            params,
         }
     }
 
@@ -242,8 +246,30 @@ impl Song {
         &self.path
     }
 
-    pub fn duration(&self) -> &Duration {
-        &self.duration
+    pub fn duration(&self) -> Duration {
+        let time_base = self.params.time_base.unwrap();
+        let n_frames = self.params.n_frames.unwrap();
+        time_base.calc_time(n_frames).into()
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        // TODO: this should return a result instead of unwrapping
+        let codec_registry = symphonia::default::get_codecs();
+        codec_registry
+            .make(&self.params, &Default::default())
+            .unwrap()
+    }
+
+    fn time_base(&self) -> TimeBase {
+        self.params
+            .time_base
+            .expect("Every song should have a timebase")
+    }
+}
+
+impl Display for Song {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Song({}, {:?})", self.title, self.path)
     }
 }
 
@@ -283,8 +309,6 @@ impl Playlist {
                 };
                 let track = format_reader.default_track().unwrap();
                 let params = &track.codec_params;
-                let time_base = params.time_base.unwrap();
-                let duration: Duration = time_base.calc_time(params.n_frames.unwrap()).into();
 
                 // Figure out a way to collect title from metadata
                 // Metadata appears to be empty for test tracks
@@ -292,7 +316,7 @@ impl Playlist {
                     .file_name()
                     .into_string()
                     .expect("Could not convert filename to string");
-                Some(Song::new(song_title, path.path(), duration))
+                Some(Song::new(track.id, song_title, path.path(), params.clone()))
             })
             .collect();
         songs
@@ -315,6 +339,8 @@ pub enum PlayerMessage {
     Pause,
     /// Resume the player if Pause was sent previously, does nothing if already playing.
     Resume,
+    /// Seek to this duration and recreate the decoder
+    Seek(Duration),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -325,6 +351,12 @@ pub enum PlayerState {
     Finished,
     Paused,
     Playing,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum SeekError {
+    OutOfRange { to: Duration, max: Duration },
+    NoCurrentSong,
 }
 
 pub struct Player {
@@ -469,9 +501,6 @@ impl Player {
             let buffer = HeapRb::<SampleType>::new(1024 * 32);
             let (mut producer, consumer) = buffer.split();
 
-            let codec_registry = symphonia::default::get_codecs();
-            let probe = symphonia::default::get_probe();
-
             let (device, stream_config) = init_cpal();
             let stream_channels = stream_config.channels() as usize;
             // TODO: This might not work because of different channel amounts, idk how mp3 works
@@ -491,9 +520,10 @@ impl Player {
                 let song = {
                     let mut queue_lock = queue.lock().map_err(|e| anyhow!("{e}"))?;
                     if let Some(song) = queue_lock.next() {
-                        println!("Song found: {:?}", song);
+                        println!("Song found: {:?}", song.title);
                         let mut current_lock = current.write();
                         *current_lock = Some(song.clone());
+                        // FIXME: Cloning is annoying
                         song.clone()
                     } else {
                         println!("Got none from Queue, exiting");
@@ -503,34 +533,20 @@ impl Player {
                     }
                 };
                 let mss = {
-                    if let Ok(f) = File::open(song.path) {
+                    if let Ok(f) = File::open(&song.path) {
                         let media_source_options = MediaSourceStreamOptions::default();
                         MediaSourceStream::new(Box::new(f), media_source_options)
                     } else {
-                        println!("Coudln't find the song file");
+                        println!("Coudln't find the file for song: {}", song);
                         continue;
                     }
                 };
                 println!("Created mss");
-                let mut format_reader = {
-                    let mut hint = Hint::new();
-                    hint.with_extension("mp3");
-                    let mut format_opts = FormatOptions::default();
-                    format_opts.enable_gapless = true;
-                    let metadata_opts = MetadataOptions::default();
-                    probe
-                        .format(&hint, mss, &format_opts, &metadata_opts)
-                        .unwrap()
-                        .format
-                };
-                println!("Created format_reader");
-                let track = format_reader.default_track().unwrap();
-                println!("Got track");
-                let time_base = track.codec_params.time_base.unwrap();
-                let mut decoder = codec_registry
-                    .make(&track.codec_params, &DecoderOptions::default())
-                    .unwrap();
-                println!("Created decoder");
+                // These use unwrap, so I'll need to refactor this
+                let mut format_reader = get_format_reader(mss);
+                let mut decoder = song.decoder();
+                println!("Created reader and decoder");
+                let time_base = song.params.time_base.unwrap();
 
                 {
                     let mut duration_lock = duration.write();
@@ -558,6 +574,27 @@ impl Player {
                                 let mut state_lock = state.write();
                                 *state_lock = PlayerState::Playing;
                                 playing = true;
+                            }
+                            PlayerMessage::Seek(dur) => {
+                                use symphonia::core::formats::{SeekMode, SeekTo};
+                                let time: Time = dur.into();
+                                let track_id = song.id;
+                                let seeked_to = format_reader
+                                    .seek(
+                                        SeekMode::Accurate,
+                                        SeekTo::Time {
+                                            time,
+                                            track_id: Some(track_id),
+                                        },
+                                    )
+                                    // idk why this would fail yet and I can't be bothered to look it up
+                                    .expect("Temporary, why did you fail");
+                                let mut dur_lock = duration.write();
+                                let time_base = song.time_base();
+                                let time = time_base.calc_time(seeked_to.actual_ts);
+                                *dur_lock = time.into();
+                                // Reset the decoder, the docs say this should be done
+                                decoder = song.decoder();
                             }
                         }
                     }
@@ -614,16 +651,33 @@ impl Player {
         });
     }
 
-    /// Seek to this percentage of the song
-    pub fn seek_portion(&self, percentage: f32) {
-        if let Some(song) = self.current() {
-            self.seek_duration(song.duration().mul_f32(percentage));
+    /// Seek to a specific duration of the song.
+    /// If the duration is longer than the maximum duration returns an error
+    pub fn seek_duration(&self, duration: Duration) -> Result<bool, SeekError> {
+        let dur_max = self.current().ok_or(SeekError::NoCurrentSong)?.duration();
+        if duration > dur_max {
+            return Err(SeekError::OutOfRange {
+                to: duration,
+                max: dur_max,
+            });
         }
-    }
-
-    pub fn seek_duration(&self, duration: Duration) {
         println!("Seeking to: {:.2}", duration.as_secs_f32());
+        Ok(self.send_message(PlayerMessage::Seek(duration)))
     }
+}
+
+fn get_format_reader(mss: MediaSourceStream) -> Box<dyn FormatReader> {
+    // TODO: This should return a return instead of unwrapping
+    let probe = symphonia::default::get_probe();
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let mut format_opts = FormatOptions::default();
+    format_opts.enable_gapless = true;
+    let metadata_opts = MetadataOptions::default();
+    probe
+        .format(&hint, mss, &format_opts, &metadata_opts)
+        .unwrap()
+        .format
 }
 
 fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
