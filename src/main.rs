@@ -3,72 +3,89 @@ use std::time::Duration;
 use amuseing::{player::Playlist, Player, PlayerState, Queue, RepeatMode};
 
 use eframe::{run_native, App};
-use egui::{Color32, Sense, ViewportBuilder, Widget};
+use egui::{Color32, Layout, Sense, ViewportBuilder, Widget};
 
 struct PlaylistButton {
     playlist_name: String,
+    selected: bool,
 }
 
 impl PlaylistButton {
     fn new(name: String) -> Self {
         Self {
             playlist_name: name,
+            selected: false,
         }
+    }
+
+    fn selected(self, selected: bool) -> Self {
+        Self { selected, ..self }
     }
 }
 
 impl Widget for PlaylistButton {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        let frame = egui::Frame::none();
+        let color = if self.selected {
+            Color32::GRAY
+        } else {
+            Color32::DARK_GRAY
+        };
+        let frame = egui::Frame::none().fill(color).rounding(5.0);
         frame
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
-                ui.horizontal_centered(|ui| ui.label(self.playlist_name))
+                ui.vertical(|ui| {
+                    ui.horizontal_centered(|ui| ui.label(self.playlist_name));
+                });
             })
             .response
     }
 }
 
+fn format_time(secs: &u64) -> String {
+    let (mins, secs) = (secs / 60, secs % 60);
+    let (hours, mins) = (mins / 60, mins % 60);
+    if hours == 0 {
+        format!("{mins:02}:{secs:02}")
+    } else {
+        format!("{hours:02}:{mins:02}:{secs:02}")
+    }
+}
+
 struct PlayerControls<'a> {
     player: &'a mut Player,
+    song: &'a amuseing::Song,
 }
 
 impl<'a> PlayerControls<'a> {
-    fn new(player: &'a mut Player) -> Self {
-        Self { player }
+    fn new(player: &'a mut Player, song: &'a amuseing::Song) -> Self {
+        Self { player, song }
     }
 }
 
 impl<'a> Widget for &mut PlayerControls<'a> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        let duration_bar_height = ui.available_height() * 0.1;
+        let duration_bar_height = ui.available_height() * 0.05;
+        let duration_total = self.song.duration();
+        let duration = self.player.duration();
+        let duration_portion = duration.as_secs_f32() / duration_total.as_secs_f32();
 
-        ui.vertical_centered(|ui| {
-            let ctx = ui.ctx();
-            if !ctx.has_requested_repaint() {
-                ui.ctx().request_repaint_after(Duration::from_millis(10));
+        ui.vertical(|ui| {
+            if self.player.is_playing() {
+                if !ui.ctx().has_requested_repaint() {
+                    ui.ctx().request_repaint_after(Duration::from_millis(10));
+                }
             }
-            let song = self.player.current();
-            let portion = song.as_ref().map_or(0.0, |song| {
-                let duration_total = song.duration();
-                let duration = self.player.duration();
-                duration.as_secs_f32() / duration_total.as_secs_f32()
-            });
             let duration_frame = egui::Frame::none().fill(Color32::DARK_GRAY);
             let resp = duration_frame
                 .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.set_min_height(duration_bar_height);
-                    ui.horizontal(|ui| {
-                        let colored_frame = egui::Frame::none().fill(Color32::YELLOW);
-                        colored_frame.show(ui, |ui| {
-                            let colored_width = ui.available_width() * portion;
-                            ui.set_width(colored_width);
-
-                            // FIXME: This is a hack.
-                            // The frame doesn't show up if there are no widgets inside it
-                            ui.label("");
-                        })
+                    ui.set_width(ui.available_width());
+                    ui.set_height(duration_bar_height);
+                    let colored_frame = egui::Frame::none().fill(Color32::YELLOW);
+                    colored_frame.show(ui, |ui| {
+                        let colored_width = ui.available_width() * duration_portion;
+                        ui.set_width(colored_width);
+                        ui.set_height(duration_bar_height);
                     })
                 })
                 .response
@@ -81,93 +98,179 @@ impl<'a> Widget for &mut PlayerControls<'a> {
                 let left = resp.rect.left();
                 let width = resp.rect.width();
                 let portion = (mouse_x - left) / width;
-                self.player.seek_portion(portion);
-            }
+                let duration = self.song.duration().mul_f32(portion);
 
-            ui.columns(3, |columns| {
-                columns[0].vertical_centered(|ui| {
-                    if ui.button("<").clicked() {
-                        self.player.rewind();
-                    }
+                self.player
+                    .seek_duration(duration)
+                    .expect("Seeking from the bar should not fail");
+            }
+            if resp.hovered() {
+                let mouse_x = resp.hover_pos().unwrap().x;
+                let left = resp.rect.left();
+                let width = resp.rect.width();
+                let portion = (mouse_x - left) / width;
+                let duration = self.song.duration().mul_f32(portion);
+
+                resp.on_hover_ui_at_pointer(|ui| {
+                    let text = format_time(&duration.as_secs());
+                    ui.label(text);
                 });
-                columns[1].vertical_centered(|ui| {
-                    let playing = match self.player.state() {
-                        PlayerState::Playing => true,
-                        _ => false,
-                    };
-                    let button_text = if playing { "||" } else { "|>" };
-                    if ui.button(button_text).clicked() {
-                        if playing {
-                            self.player.pause();
-                        } else {
-                            self.player.resume();
-                        }
-                    }
-                });
-                columns[2].vertical_centered(|ui| {
-                    if ui.button(">").clicked() {
-                        self.player.fast_forward();
-                    }
-                })
-            })
+            }
+        });
+
+        ui.horizontal_centered(|ui| {
+            let main_controls_width = ui.available_width() * 0.15;
+            ui.allocate_ui(
+                egui::vec2(main_controls_width, ui.available_height()),
+                |ui| {
+                    ui.set_height(ui.available_height() * 0.8);
+                    ui.set_width(main_controls_width);
+                    ui.columns(3, |columns| {
+                        columns[0].centered_and_justified(|ui| {
+                            if ui.button("<").clicked() {
+                                self.player.rewind();
+                            }
+                        });
+                        columns[1].centered_and_justified(|ui| {
+                            let playing = self.player.is_playing();
+                            let button_text = if playing { "||" } else { "|>" };
+                            if ui.button(button_text).clicked() {
+                                if playing {
+                                    self.player.pause();
+                                } else {
+                                    self.player.resume();
+                                }
+                            }
+                        });
+                        columns[2].centered_and_justified(|ui| {
+                            if ui.button(">").clicked() {
+                                self.player.fast_forward();
+                            }
+                        })
+                    })
+                },
+            );
+            let formatted_passed = format_time(&duration.as_secs());
+            let formatted_total = format_time(&duration_total.as_secs());
+            let formatted_label = format!("{formatted_passed} / {formatted_total}");
+            // let label_width = ui.available_width() * 0.05;
+            ui.label(formatted_label);
         })
         .response
     }
 }
 
+struct SongWidget<'a> {
+    playlist: &'a Playlist,
+    player: &'a mut Player,
+    song: &'a amuseing::Song,
+    id: usize,
+    height: Option<f32>,
+}
+
+impl<'a> SongWidget<'a> {
+    pub fn new(
+        playlist: &'a Playlist,
+        player: &'a mut Player,
+        song: &'a amuseing::Song,
+        id: usize,
+    ) -> Self {
+        Self {
+            playlist,
+            player,
+            song,
+            id,
+            height: None,
+        }
+    }
+
+    pub fn with_height(self, height: f32) -> Self {
+        Self {
+            height: Some(height),
+            ..self
+        }
+    }
+}
+
+impl<'a> Widget for &'a mut SongWidget<'a> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let frame = egui::Frame::none().fill(Color32::from_gray(50));
+        frame
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if let Some(height) = self.height {
+                    ui.set_height(height);
+                }
+                ui.horizontal_centered(|ui| {
+                    if ui.button("|>").clicked() {
+                        println!("Should play song: {}", self.song.title());
+                        self.playlist.play_from_index(self.player, self.id)
+                    }
+                    ui.label(self.song.title());
+                    ui.label(self.song.duration().as_secs().to_string());
+                })
+            })
+            .response
+    }
+}
+
 struct AmuseingApp {
     playlists: Vec<Playlist>,
-    current_playlist_id: Option<usize>,
+    current_playlist_index: usize,
     player: Player,
 }
 
 impl Default for AmuseingApp {
     fn default() -> Self {
-        let playlist = Playlist::new("Bruh".to_string(), "D:\\coding\\amuseing\\audio".into());
-        let songs = playlist.songs();
-        println!("{:?}", songs);
+        let playlists = vec![
+            Playlist::new("Bruh 1".to_string(), "D:\\coding\\amuseing\\audio".into()),
+            Playlist::new("Bruh 2".to_string(), "D:\\coding\\amuseing\\audio".into()),
+        ];
+        let songs = playlists[0].songs();
         let queue = Queue::new(songs, 0, RepeatMode::All);
         let player = Player::with_queue(queue);
         Self {
-            playlists: Vec::new(),
-            current_playlist_id: None,
+            playlists,
+            current_playlist_index: 0,
             player,
         }
     }
 }
 
 impl App for AmuseingApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        let (monitor_size, content_size) = ctx.input(|i| {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let (content_width, content_height) = ctx.input(|i| {
             let viewport = i.viewport();
-            (viewport.monitor_size.unwrap(), viewport.inner_rect.unwrap())
+            let rect = viewport.inner_rect.unwrap();
+            (rect.width(), rect.height())
         });
 
-        let song_panel_height_ratio = 0.12;
-        let song_panel_min_height = monitor_size.x * 0.05;
-        let song_panel_max_height = monitor_size.x * 1.;
+        let _song_panel_height_ratio = 0.12;
+        let song_panel_min_height = content_height * 0.12;
+        let _song_panel_max_height = content_height * 1.;
 
         let playlist_panel_width_ratio = 0.2;
-        let playlist_panel_min_width = monitor_size.x * 0.1;
-        let playlist_panel_max_width = monitor_size.x * 1.;
+        let playlist_panel_min_width = content_width * 0.1;
+        let playlist_panel_max_width = content_width * 1.;
 
         let playlist_button_height_ratio = 0.15;
-        let min_playlist_button_height = monitor_size.y * 0.075;
-        let max_playlist_button_height = monitor_size.y * 1.;
+        let min_playlist_button_height = content_height * 0.075;
+        let max_playlist_button_height = content_height * 1.;
 
-        // let song_panel_height = (content_size.height() * song_panel_height_ratio)
-        //     .clamp(song_panel_min_height, song_panel_max_height);
-        let song_panel_height = song_panel_min_height;
-        let song_panel = egui::TopBottomPanel::bottom("Song panel")
-            .exact_height(song_panel_height)
-            .resizable(false);
+        if let Some(song) = self.player.current() {
+            // let song_panel_height = (content_size.height() * song_panel_height_ratio)
+            //     .clamp(song_panel_min_height, song_panel_max_height);
+            let song_panel_height = song_panel_min_height;
+            let song_panel = egui::TopBottomPanel::bottom("Song panel")
+                .exact_height(song_panel_height)
+                .resizable(false);
 
-        song_panel.show(ctx, |ui| {
-            // TODO: progress bar after adding total duration to `Song`
-            ui.centered_and_justified(|ui| {
-                ui.add(&mut PlayerControls::new(&mut self.player));
-            })
-        });
+            song_panel.show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.add(&mut PlayerControls::new(&mut self.player, &song));
+                })
+            });
+        }
 
         let center_panel = egui::CentralPanel::default();
         center_panel.show(ctx, |ui| {
@@ -188,33 +291,49 @@ impl App for AmuseingApp {
                     let mut size = ui.available_size();
                     size.y = (size.y * playlist_button_height_ratio)
                         .clamp(min_playlist_button_height, max_playlist_button_height);
-                    for (i, playlist) in self.playlists.iter().enumerate() {
-                        let playlist_button = PlaylistButton::new(playlist.name().to_string());
-                        if ui
-                            .add_sized(size, playlist_button)
-                            .interact(egui::Sense::click())
-                            .clicked()
-                        {
-                            self.current_playlist_id = Some(i);
-                        };
-                        if i != self.playlists.len() - 1 {
-                            let sep = egui::Separator::default().spacing(25.);
-                            ui.add(sep);
-                        }
-                    }
-                })
+                    draw_playlists(ui, &self.playlists, &mut self.current_playlist_index, size);
+                });
             });
-            ui.centered_and_justified(|ui| {
-                if let Some(playlist_id) = self.current_playlist_id {
-                    let playlist = &self.playlists[playlist_id];
-                    ui.label(playlist.name());
-                } else {
-                    if ui.button("Click me to start").clicked() {
-                        self.player.run();
-                    }
-                }
-            })
+            if self.current_playlist_index < self.playlists.len() {
+                let playlist = &self.playlists[self.current_playlist_index];
+                let scroll_area = egui::ScrollArea::vertical()
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+                scroll_area.show(ui, |ui| {
+                    draw_playlist_songs(&mut self.player, ui, playlist);
+                });
+            } else {
+                ui.centered_and_justified(|ui| {
+                    // TODO: Add button for creating new playlists or opening a folder
+                    ui.label("You have no playlists created")
+                });
+            }
         });
+    }
+}
+
+fn draw_playlist_songs(player: &mut Player, ui: &mut egui::Ui, playlist: &Playlist) {
+    let height = ui.available_height() * 0.1;
+    for (id, song) in playlist.songs().iter().enumerate() {
+        let song_widget = &mut SongWidget::new(playlist, player, song, id).with_height(height);
+        ui.add(song_widget);
+    }
+}
+
+fn draw_playlists(ui: &mut egui::Ui, playlists: &[Playlist], id: &mut usize, size: egui::Vec2) {
+    for (i, playlist) in playlists.iter().enumerate() {
+        let playlist_button = PlaylistButton::new(playlist.name().to_string()).selected(*id == i);
+        if ui
+            .add_sized(size, playlist_button)
+            .interact(egui::Sense::click())
+            .clicked()
+        {
+            *id = i;
+        };
+        if i != playlists.len() - 1 {
+            // FIXME: separators don't increase in size, only increase margins
+            let sep = egui::Separator::default().spacing(25.);
+            ui.add(sep);
+        }
     }
 }
 

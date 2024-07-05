@@ -10,8 +10,9 @@ use ringbuf::{
     HeapRb,
 };
 use std::{
+    collections::VecDeque,
     fmt::Display,
-    fs::{self, File},
+    fs,
     path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     thread,
@@ -21,11 +22,12 @@ use symphonia::core::{
     audio::{AudioBuffer, Signal},
     codecs::{CodecParameters, Decoder},
     formats::{FormatOptions, FormatReader},
-    io::{MediaSourceStream, MediaSourceStreamOptions},
+    io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions},
     meta::MetadataOptions,
     probe::Hint,
-    units::{Time, TimeBase},
+    units,
 };
+use thiserror::Error;
 
 type SampleType = i16;
 
@@ -43,7 +45,7 @@ pub enum RepeatMode {
     Off,
 }
 
-// A new queue is created everytime a different set of songs is loaded,
+// A new queue is created everytime a different set of songs is loaded for the player,
 // and the queue does not change if the playlist it was created from updates
 // because sharing that update across threads would be a headache
 
@@ -161,14 +163,17 @@ impl<T> Queue<T> {
         Some(&mut self.items[i])
     }
 
+    /// Equivalent to Vec::push
     pub fn push(&mut self, value: T) {
         self.items.push(value)
     }
 
+    /// Equivalent to Vec::insert
     pub fn insert(&mut self, index: usize, value: T) {
         self.items.insert(index, value)
     }
 
+    /// Equivalent to Vec::swap
     pub fn swap(&mut self, a: usize, b: usize) {
         self.items.swap(a, b)
     }
@@ -260,7 +265,7 @@ impl Song {
             .unwrap()
     }
 
-    fn time_base(&self) -> TimeBase {
+    fn time_base(&self) -> units::TimeBase {
         self.params
             .time_base
             .expect("Every song should have a timebase")
@@ -285,38 +290,33 @@ impl Playlist {
     }
 
     pub fn songs(&self) -> Vec<Song> {
-        let probe = symphonia::default::get_probe();
         let paths = fs::read_dir(&self.path).expect("Playlist path invalid");
         let songs = paths
-            .filter_map(|path| {
-                let path = path.ok()?;
-                let mss = if let Ok(f) = File::open(path.path()) {
-                    let media_source_options = MediaSourceStreamOptions::default();
-                    MediaSourceStream::new(Box::new(f), media_source_options)
-                } else {
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                if entry.path().extension()? != "mp3" {
+                    return None;
+                }
+                let Ok(song_file) = fs::File::open(entry.path()) else {
                     return None;
                 };
-                let format_reader = {
-                    let mut hint = Hint::new();
-                    hint.with_extension("mp3");
-                    let mut format_opts = FormatOptions::default();
-                    format_opts.enable_gapless = true;
-                    let metadata_opts = MetadataOptions::default();
-                    probe
-                        .format(&hint, mss, &format_opts, &metadata_opts)
-                        .unwrap()
-                        .format
-                };
+                let mss = MediaSourceStream::new(Box::new(song_file), Default::default());
+                let format_reader = get_format_reader(mss);
                 let track = format_reader.default_track().unwrap();
                 let params = &track.codec_params;
 
                 // Figure out a way to collect title from metadata
                 // Metadata appears to be empty for test tracks
-                let song_title = path
+                let song_title = entry
                     .file_name()
                     .into_string()
                     .expect("Could not convert filename to string");
-                Some(Song::new(track.id, song_title, path.path(), params.clone()))
+                Some(Song::new(
+                    track.id,
+                    song_title,
+                    entry.path(),
+                    params.clone(),
+                ))
             })
             .collect();
         songs
@@ -324,6 +324,11 @@ impl Playlist {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn play_from_index(&self, player: &mut Player, index: usize) {
+        let queue = Queue::new(self.songs(), index, RepeatMode::Off);
+        player.run_with_queue(queue);
     }
 }
 
@@ -347,15 +352,18 @@ pub enum PlayerMessage {
 pub enum PlayerState {
     /// Indicates the `Player`s run method hasn't been called.
     NotStarted,
-    /// Indicates the `Player` thread has finished at least once.
+    /// Indicates the `Player` thread has finished.
     Finished,
     Paused,
     Playing,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug, Error)]
 pub enum SeekError {
+    #[error("Invalid seek Duration (expected maximum {max:?}, got {to:?})")]
     OutOfRange { to: Duration, max: Duration },
+    // Returned when the Player tries to seek but there is no song playing;
+    #[error("The player does not have a song which can be skipped")]
     NoCurrentSong,
 }
 
@@ -366,8 +374,13 @@ pub struct Player {
     state: Arc<RwLock<PlayerState>>,
     /// non-zero if the player is playing, this isn't an indicator of state
     time_playing: Arc<RwLock<Duration>>,
+    // TODO: Change this to be a &Song
     current: Arc<RwLock<Option<Song>>>,
 }
+
+#[derive(Debug, Error)]
+#[error("The player is already running")]
+pub struct PlayerRunningError;
 
 impl Player {
     pub fn new() -> Self {
@@ -390,10 +403,16 @@ impl Player {
         self.queue.as_ref()
     }
 
+    /// Returns at what point the player is in the Song
+    ///
+    /// NOTE: This is not the duration of the song, use `current` and `Song::duration` for  that
     pub fn duration(&self) -> Duration {
         *self.time_playing.read()
     }
 
+    /// Return a cloned version of the song that is currently playing.
+    ///
+    /// NOTE: This returns Some(Song) even when paused
     pub fn current(&self) -> Option<Song> {
         // TODO: Make this return a reference to the Song if possible
         self.current.read().clone()
@@ -404,10 +423,10 @@ impl Player {
     /// Returns a bool to signal message success
     /// `true` means the message was sent successfully
     pub fn send_message(&self, message: PlayerMessage) -> bool {
-        if let Some(sender) = &self.sender {
-            return sender.send(message).is_ok();
-        }
-        false
+        let Some(sender) = &self.sender else {
+            return false;
+        };
+        sender.send(message).is_ok()
     }
 
     /// Send a signal to stop playing, which effectively skips the current song
@@ -475,17 +494,43 @@ impl Player {
         *self.state.read()
     }
 
+    pub fn is_playing(&self) -> bool {
+        matches!(self.state(), PlayerState::Playing)
+    }
+
+    pub fn is_paused(&self) -> bool {
+        matches!(self.state(), PlayerState::Paused)
+    }
+
+    pub fn is_running(&self) -> bool {
+        !matches!(
+            self.state(),
+            PlayerState::NotStarted | PlayerState::Finished
+        )
+    }
+
+    /// Convenience function for changing the queue and starting the player immediately
+    pub fn run_with_queue(&mut self, queue: Queue<Song>) {
+        {
+            let mut queue_lock = self.queue.lock().unwrap();
+            *queue_lock = queue;
+        }
+        self.stop();
+        let _ = self.run();
+    }
+
     // TODO: add result if already playing, currently we just panic
-    pub fn run(&mut self) {
-        println!("Running");
+    // unfortunately I can't make it move self, since I need the Player for the ui
+    pub fn run(&mut self) -> Result<(), PlayerRunningError> {
         {
             let mut state_lock = self.state.write();
             match *state_lock {
-                PlayerState::Playing | PlayerState::Paused => panic!("Player already started"),
+                PlayerState::Playing | PlayerState::Paused => return Err(PlayerRunningError),
                 _ => {}
             }
             *state_lock = PlayerState::Paused;
         }
+        println!("Running");
 
         let queue = self.queue.clone();
         let state = self.state.clone();
@@ -495,7 +540,6 @@ impl Player {
         let (tx, rx) = mpsc::channel::<PlayerMessage>();
         self.sender = Some(tx);
 
-        println!("Pre thread");
         thread::spawn(move || -> Result<()> {
             // Idk if 32KiB is too much or too little
             let buffer = HeapRb::<SampleType>::new(1024 * 32);
@@ -518,7 +562,7 @@ impl Player {
 
             loop {
                 let song = {
-                    let mut queue_lock = queue.lock().map_err(|e| anyhow!("{e}"))?;
+                    let mut queue_lock = queue.lock().unwrap();
                     if let Some(song) = queue_lock.next() {
                         println!("Song found: {:?}", song.title);
                         let mut current_lock = current.write();
@@ -529,24 +573,29 @@ impl Player {
                         println!("Got none from Queue, exiting");
                         let mut state_lock = state.write();
                         *state_lock = PlayerState::Finished;
+
+                        let mut current_lock = current.write();
+                        *current_lock = None;
                         break;
                     }
                 };
+                let channel_factor = stream_channels / song.params.channels.unwrap().count();
                 let mss = {
-                    if let Ok(f) = File::open(&song.path) {
-                        let media_source_options = MediaSourceStreamOptions::default();
-                        MediaSourceStream::new(Box::new(f), media_source_options)
-                    } else {
+                    let Ok(f) = fs::File::open(&song.path) else {
                         println!("Coudln't find the file for song: {}", song);
                         continue;
-                    }
+                    };
+                    let media_source_options = MediaSourceStreamOptions::default();
+                    MediaSourceStream::new(Box::new(f), media_source_options)
                 };
                 println!("Created mss");
+                let seekable = mss.is_seekable();
+                let time_base = song.time_base();
+                let track_id = song.id;
                 // These use unwrap, so I'll need to refactor this
                 let mut format_reader = get_format_reader(mss);
                 let mut decoder = song.decoder();
                 println!("Created reader and decoder");
-                let time_base = song.params.time_base.unwrap();
 
                 {
                     let mut duration_lock = duration.write();
@@ -558,7 +607,7 @@ impl Player {
 
                 let mut playing = true;
                 let mut source_exhausted = false;
-                let mut sample_vec: Vec<SampleType> = vec![];
+                let mut sample_deque: VecDeque<SampleType> = VecDeque::new();
                 while !source_exhausted || !producer.is_empty() {
                     if let Ok(message) = rx.try_recv() {
                         match message {
@@ -577,8 +626,10 @@ impl Player {
                             }
                             PlayerMessage::Seek(dur) => {
                                 use symphonia::core::formats::{SeekMode, SeekTo};
-                                let time: Time = dur.into();
-                                let track_id = song.id;
+                                let time: units::Time = dur.into();
+                                // FormatReader is seekable depending on the MediaSourceStream.is_seekable() method
+                                // I'm fairly certain this should always be true for mp3 files
+                                // TODO: The bool `seekable` should be used to check if we can seek, I don't know how to handle that yet
                                 let seeked_to = format_reader
                                     .seek(
                                         SeekMode::Accurate,
@@ -587,13 +638,11 @@ impl Player {
                                             track_id: Some(track_id),
                                         },
                                     )
-                                    // idk why this would fail yet and I can't be bothered to look it up
-                                    .expect("Temporary, why did you fail");
+                                    .expect("Mp3 readers should always be seekable");
                                 let mut dur_lock = duration.write();
-                                let time_base = song.time_base();
                                 let time = time_base.calc_time(seeked_to.actual_ts);
                                 *dur_lock = time.into();
-                                // Reset the decoder, the docs say this should be done
+                                // Reset the decoder after seeking, the docs say this is a necessary step
                                 decoder = song.decoder();
                             }
                         }
@@ -601,16 +650,18 @@ impl Player {
                     if !playing {
                         continue;
                     }
-                    if !sample_vec.is_empty() {
+                    if !sample_deque.is_empty() {
                         // If there is a buffer available, write data to the producer if there is space
-                        let n = producer.vacant_len().min(sample_vec.len());
-                        if n > 0 {
-                            producer.push_iter(sample_vec.drain(0..n));
-                        } else {
-                            thread::sleep(Duration::from_millis(10));
+                        while producer.vacant_len() >= channel_factor {
+                            let Some(sample) = sample_deque.pop_front() else {
+                                break;
+                            };
+                            for _ in 0..channel_factor {
+                                producer.try_push(sample).unwrap();
+                            }
                         }
                     } else {
-                        // Generate the sample buffer if we fully used the last one
+                        // Push samples for the sample deque if none are available
 
                         // TODO: figure out resampling
 
@@ -624,22 +675,13 @@ impl Player {
                             let mut audio_buf_type: AudioBuffer<SampleType> =
                                 audio_buf.make_equivalent();
                             audio_buf.convert(&mut audio_buf_type);
-                            let channels = audio_buf.spec().channels.count();
-                            let channel_factor = stream_channels / channels;
-                            let num_samples = audio_buf.frames() * stream_channels;
-                            sample_vec = vec![SampleType::EQUILIBRIUM; num_samples];
-                            // TODO: It's probably a better idea to copy only the audio buffer, and adapt the channel layout while writing
-                            for ch in 0..channels {
-                                let channel_slice = audio_buf_type.chan(ch);
-                                for (chunk, source) in sample_vec
-                                    .chunks_mut(channel_factor)
-                                    .step_by(channels)
-                                    .zip(channel_slice)
-                                {
-                                    for dst in chunk {
-                                        *dst = source.to_sample();
-                                    }
-                                }
+                            for (l, r) in audio_buf_type
+                                .chan(0)
+                                .iter()
+                                .zip(audio_buf_type.chan(1).iter())
+                            {
+                                sample_deque.push_back(*l);
+                                sample_deque.push_back(*r);
                             }
                         } else {
                             source_exhausted = true;
@@ -649,6 +691,7 @@ impl Player {
             }
             Ok(())
         });
+        Ok(())
     }
 
     /// Seek to a specific duration of the song.
