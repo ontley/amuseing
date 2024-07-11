@@ -1,9 +1,9 @@
-use std::time::Duration;
+use std::{borrow::Borrow, time::Duration};
 
-use amuseing::{player::Playlist, Player, PlayerState, Queue, RepeatMode};
+use amuseing::{player::Playlist, Player, Queue, RepeatMode};
 
 use eframe::{run_native, App};
-use egui::{Color32, Layout, Sense, ViewportBuilder, Widget};
+use egui::{Color32, Sense, ViewportBuilder, Widget};
 
 struct PlaylistButton {
     playlist_name: String,
@@ -55,11 +55,16 @@ fn format_time(secs: &u64) -> String {
 struct PlayerControls<'a> {
     player: &'a mut Player,
     song: &'a amuseing::Song,
+    volume: &'a mut f32,
 }
 
 impl<'a> PlayerControls<'a> {
-    fn new(player: &'a mut Player, song: &'a amuseing::Song) -> Self {
-        Self { player, song }
+    fn new(player: &'a mut Player, song: &'a amuseing::Song, volume: &'a mut f32) -> Self {
+        Self {
+            player,
+            song,
+            volume,
+        }
     }
 }
 
@@ -70,6 +75,9 @@ impl<'a> Widget for &mut PlayerControls<'a> {
         let duration = self.player.duration();
         let duration_portion = duration.as_secs_f32() / duration_total.as_secs_f32();
 
+        //
+        // Render the duration bar
+        //
         ui.vertical(|ui| {
             if self.player.is_playing() {
                 if !ui.ctx().has_requested_repaint() {
@@ -85,40 +93,38 @@ impl<'a> Widget for &mut PlayerControls<'a> {
                     colored_frame.show(ui, |ui| {
                         let colored_width = ui.available_width() * duration_portion;
                         ui.set_width(colored_width);
-                        ui.set_height(duration_bar_height);
+                        ui.set_height(ui.available_height());
                     })
                 })
                 .response
                 .interact(Sense::click_and_drag());
-            if resp.clicked() || resp.dragged() {
-                let mouse_x = resp
-                    .interact_pointer_pos()
-                    .expect("Should not be None if there is an interaction")
-                    .x;
-                let left = resp.rect.left();
-                let width = resp.rect.width();
-                let portion = (mouse_x - left) / width;
+
+            if let Some(mouse_pos) = resp.interact_pointer_pos() {
+                let mouse_x = mouse_pos.x;
+                let rect_left = resp.rect.left();
+                let rect_width = resp.rect.width();
+                let portion = (mouse_x - rect_left) / rect_width;
                 let duration = self.song.duration().mul_f32(portion);
 
-                self.player
-                    .seek_duration(duration)
-                    .expect("Seeking from the bar should not fail");
-            }
-            if resp.hovered() {
-                let mouse_x = resp.hover_pos().unwrap().x;
-                let left = resp.rect.left();
-                let width = resp.rect.width();
-                let portion = (mouse_x - left) / width;
-                let duration = self.song.duration().mul_f32(portion);
-
-                resp.on_hover_ui_at_pointer(|ui| {
-                    let text = format_time(&duration.as_secs());
-                    ui.label(text);
-                });
+                if resp.clicked() || resp.dragged() {
+                    self.player
+                        .seek_duration(duration)
+                        .expect("Seeking from the bar should not fail");
+                }
+                // Show a tooltip of the duration to seek to
+                if resp.hovered() {
+                    resp.on_hover_ui_at_pointer(|ui| {
+                        let text = format_time(&duration.as_secs());
+                        ui.label(text);
+                    });
+                }
             }
         });
 
         ui.horizontal_centered(|ui| {
+            //
+            // Render the player buttons (rewind, pause/play, fast-forward)
+            //
             let main_controls_width = ui.available_width() * 0.15;
             ui.allocate_ui(
                 egui::vec2(main_controls_width, ui.available_height()),
@@ -150,11 +156,28 @@ impl<'a> Widget for &mut PlayerControls<'a> {
                     })
                 },
             );
+            //
+            // Shot a ratio of the time passed / duration of the song
+            // e.g. 2:03 / 3:12
+            //
             let formatted_passed = format_time(&duration.as_secs());
             let formatted_total = format_time(&duration_total.as_secs());
             let formatted_label = format!("{formatted_passed} / {formatted_total}");
             // let label_width = ui.available_width() * 0.05;
             ui.label(formatted_label);
+
+            let slider = egui::Slider::new(self.volume, 0f32..=1f32).show_value(false);
+            let resp = ui.add(slider);
+            // This doesn't work properly I think, because only the "head" of the slider should be interacted with.
+            // Or maybe it does.
+            if resp.clicked() || resp.dragged() {
+                self.player.set_volume(self.volume);
+            };
+
+            if ui.button("🔁").clicked() {
+                let mut queue_lock = self.player.queue().lock().unwrap();
+                queue_lock.repeat_mode = queue_lock.repeat_mode.next();
+            }
         })
         .response
     }
@@ -218,21 +241,28 @@ struct AmuseingApp {
     playlists: Vec<Playlist>,
     current_playlist_index: usize,
     player: Player,
+    volume: f32,
+    songs: Vec<amuseing::Song>,
 }
 
 impl Default for AmuseingApp {
     fn default() -> Self {
         let playlists = vec![
-            Playlist::new("Bruh 1".to_string(), "D:\\coding\\amuseing\\audio".into()),
-            Playlist::new("Bruh 2".to_string(), "D:\\coding\\amuseing\\audio".into()),
+            Playlist::new("Bruh 1".to_string(), "D:\\coding\\amuseing\\audio".into()).unwrap(),
+            Playlist::new("Bruh 2".to_string(), "D:\\coding\\amuseing\\audio".into()).unwrap(),
         ];
-        let songs = playlists[0].songs();
-        let queue = Queue::new(songs, 0, RepeatMode::All);
-        let player = Player::with_queue(queue);
+        let volume = 1.;
+        let current_playlist_index = 0;
+        let songs = playlists[current_playlist_index].songs();
+        let queue = Queue::new(Vec::new(), 0, RepeatMode::All);
+        let mut player = Player::with_queue(queue);
+        player.set_volume(&volume);
         Self {
             playlists,
-            current_playlist_index: 0,
+            current_playlist_index,
             player,
+            volume,
+            songs,
         }
     }
 }
@@ -267,7 +297,11 @@ impl App for AmuseingApp {
 
             song_panel.show(ctx, |ui| {
                 ui.centered_and_justified(|ui| {
-                    ui.add(&mut PlayerControls::new(&mut self.player, &song));
+                    ui.add(&mut PlayerControls::new(
+                        &mut self.player,
+                        &song,
+                        &mut self.volume,
+                    ));
                 })
             });
         }
@@ -291,7 +325,13 @@ impl App for AmuseingApp {
                     let mut size = ui.available_size();
                     size.y = (size.y * playlist_button_height_ratio)
                         .clamp(min_playlist_button_height, max_playlist_button_height);
-                    draw_playlists(ui, &self.playlists, &mut self.current_playlist_index, size);
+                    draw_playlists(
+                        ui,
+                        &self.playlists,
+                        &mut self.current_playlist_index,
+                        size,
+                        &mut self.songs,
+                    );
                 });
             });
             if self.current_playlist_index < self.playlists.len() {
@@ -299,7 +339,7 @@ impl App for AmuseingApp {
                 let scroll_area = egui::ScrollArea::vertical()
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
                 scroll_area.show(ui, |ui| {
-                    draw_playlist_songs(&mut self.player, ui, playlist);
+                    draw_playlist_songs(&mut self.player, ui, playlist, &self.songs);
                 });
             } else {
                 ui.centered_and_justified(|ui| {
@@ -311,23 +351,36 @@ impl App for AmuseingApp {
     }
 }
 
-fn draw_playlist_songs(player: &mut Player, ui: &mut egui::Ui, playlist: &Playlist) {
+fn draw_playlist_songs(
+    player: &mut Player,
+    ui: &mut egui::Ui,
+    playlist: &Playlist,
+    songs: &[amuseing::Song],
+) {
     let height = ui.available_height() * 0.1;
-    for (id, song) in playlist.songs().iter().enumerate() {
+    for (id, song) in songs.iter().enumerate() {
         let song_widget = &mut SongWidget::new(playlist, player, song, id).with_height(height);
         ui.add(song_widget);
     }
 }
 
-fn draw_playlists(ui: &mut egui::Ui, playlists: &[Playlist], id: &mut usize, size: egui::Vec2) {
+fn draw_playlists(
+    ui: &mut egui::Ui,
+    playlists: &[Playlist],
+    selected_id: &mut usize,
+    size: egui::Vec2,
+    songs: &mut Vec<amuseing::Song>,
+) {
     for (i, playlist) in playlists.iter().enumerate() {
-        let playlist_button = PlaylistButton::new(playlist.name().to_string()).selected(*id == i);
+        let playlist_button =
+            PlaylistButton::new(playlist.name().to_string()).selected(*selected_id == i);
         if ui
             .add_sized(size, playlist_button)
             .interact(egui::Sense::click())
             .clicked()
         {
-            *id = i;
+            *selected_id = i;
+            *songs = playlist.songs();
         };
         if i != playlists.len() - 1 {
             // FIXME: separators don't increase in size, only increase margins

@@ -3,7 +3,6 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Sample, SampleFormat, SizedSample, StreamConfig,
 };
-use egui::mutex::RwLock;
 use rand::seq::SliceRandom;
 use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
@@ -14,7 +13,7 @@ use std::{
     fmt::Display,
     fs,
     path::PathBuf,
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc, Mutex, RwLock},
     thread,
     time::Duration,
 };
@@ -43,6 +42,16 @@ pub enum RepeatMode {
     /// Iterate like a Vec, returning None after reaching the end.
     /// The `Queue` can still return elements after the end by skipping, jumping or changing the repeat mode.
     Off,
+}
+
+impl RepeatMode {
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::Single,
+            Self::Single => Self::Off,
+        }
+    }
 }
 
 // A new queue is created everytime a different set of songs is loaded for the player,
@@ -123,7 +132,7 @@ impl<T> Queue<T> {
         Some(&mut self.items[self.index])
     }
 
-    /// Return a reference to what the next item **could be**, if the repeat mode doesn't change until then.
+    /// Return a reference to what the next item **could be**, if the queue isn't changed until then.
     /// This method does not advance the queue, so repeated calls without changing the repeat mode will give the same item.
     pub fn peek(&self) -> Option<&T> {
         if self.repeat_mode == RepeatMode::Single {
@@ -161,21 +170,6 @@ impl<T> Queue<T> {
             }
         }
         Some(&mut self.items[i])
-    }
-
-    /// Equivalent to Vec::push
-    pub fn push(&mut self, value: T) {
-        self.items.push(value)
-    }
-
-    /// Equivalent to Vec::insert
-    pub fn insert(&mut self, index: usize, value: T) {
-        self.items.insert(index, value)
-    }
-
-    /// Equivalent to Vec::swap
-    pub fn swap(&mut self, a: usize, b: usize) {
-        self.items.swap(a, b)
     }
 
     /// Return a refence to the index of the item that was returned previously.
@@ -257,7 +251,7 @@ impl Song {
         time_base.calc_time(n_frames).into()
     }
 
-    fn decoder(&self) -> Box<dyn Decoder> {
+    fn get_decoder(&self) -> Box<dyn Decoder> {
         // TODO: this should return a result instead of unwrapping
         let codec_registry = symphonia::default::get_codecs();
         codec_registry
@@ -266,6 +260,7 @@ impl Song {
     }
 
     fn time_base(&self) -> units::TimeBase {
+        // TODO: maybe check if the timebase is Some when creating the song
         self.params
             .time_base
             .expect("Every song should have a timebase")
@@ -278,15 +273,22 @@ impl Display for Song {
     }
 }
 
+#[derive(Debug, Error)]
+#[error("Can not create a playlist with a path that does not exist")]
+pub struct InvalidPath(PathBuf);
+
 pub struct Playlist {
     name: String,
     path: PathBuf,
 }
 
 impl Playlist {
-    pub fn new(name: String, path: PathBuf) -> Self {
+    pub fn new(name: String, path: PathBuf) -> Result<Self, InvalidPath> {
         // TODO: Conver to Result if the path doesn't exist
-        Self { name, path }
+        if !path.exists() {
+            return Err(InvalidPath(path));
+        }
+        Ok(Self { name, path })
     }
 
     pub fn songs(&self) -> Vec<Song> {
@@ -367,6 +369,10 @@ pub enum SeekError {
     NoCurrentSong,
 }
 
+#[derive(Debug, Error)]
+#[error("The player is already running")]
+pub struct PlayerRunningError;
+
 pub struct Player {
     queue: Arc<Mutex<Queue<Song>>>,
     /// None if the player hasn't started yet.
@@ -376,11 +382,8 @@ pub struct Player {
     time_playing: Arc<RwLock<Duration>>,
     // TODO: Change this to be a &Song
     current: Arc<RwLock<Option<Song>>>,
+    volume: Arc<RwLock<f32>>,
 }
-
-#[derive(Debug, Error)]
-#[error("The player is already running")]
-pub struct PlayerRunningError;
 
 impl Player {
     pub fn new() -> Self {
@@ -395,6 +398,7 @@ impl Player {
             state: Arc::new(RwLock::new(PlayerState::NotStarted)),
             time_playing: Arc::new(RwLock::new(Default::default())),
             current: Arc::new(RwLock::new(None)),
+            volume: Arc::new(RwLock::new(1.)),
         }
     }
 
@@ -407,7 +411,7 @@ impl Player {
     ///
     /// NOTE: This is not the duration of the song, use `current` and `Song::duration` for  that
     pub fn duration(&self) -> Duration {
-        *self.time_playing.read()
+        *self.time_playing.read().unwrap()
     }
 
     /// Return a cloned version of the song that is currently playing.
@@ -415,7 +419,7 @@ impl Player {
     /// NOTE: This returns Some(Song) even when paused
     pub fn current(&self) -> Option<Song> {
         // TODO: Make this return a reference to the Song if possible
-        self.current.read().clone()
+        self.current.read().unwrap().clone()
     }
 
     /// Send a message to the thread playing the audio
@@ -452,7 +456,7 @@ impl Player {
 
     /// Skips in the Player's `Queue` and stops playback of the current song
     ///
-    /// Returns `true` on successfull message
+    /// Returns `true` on successful message
     pub fn skip(&mut self, n: usize) -> bool {
         let mut queue_lock = self.queue.lock().unwrap();
         queue_lock.skip(n);
@@ -461,7 +465,7 @@ impl Player {
 
     /// Rewing to the previous song
     ///
-    /// Returns `true` on successfull message
+    /// Returns `true` on successful message
     pub fn rewind(&mut self) -> bool {
         let mut queue_lock = self.queue.lock().unwrap();
         // TODO: braing isn't braining idk if there's a better way of getting pos
@@ -477,6 +481,9 @@ impl Player {
         self.stop()
     }
 
+    /// Same as `stop`
+    ///
+    /// Returns `true` on successful message
     pub fn fast_forward(&mut self) -> bool {
         self.stop()
     }
@@ -491,7 +498,7 @@ impl Player {
     }
 
     pub fn state(&self) -> PlayerState {
-        *self.state.read()
+        *self.state.read().unwrap()
     }
 
     pub fn is_playing(&self) -> bool {
@@ -509,6 +516,19 @@ impl Player {
         )
     }
 
+    /// Clamp the value to 0..1 and set the volume
+    pub fn set_volume(&mut self, volume: &f32) {
+        let mut volume_lock = self.volume.write().unwrap();
+        const B: f32 = 6.9;
+        *volume_lock = if volume <= &0. {
+            0.
+        } else if volume >= &1. {
+            1.
+        } else {
+            ((volume * B).exp() - 1.) / (B.exp() - 1.)
+        };
+    }
+
     /// Convenience function for changing the queue and starting the player immediately
     pub fn run_with_queue(&mut self, queue: Queue<Song>) {
         {
@@ -523,7 +543,7 @@ impl Player {
     // unfortunately I can't make it move self, since I need the Player for the ui
     pub fn run(&mut self) -> Result<(), PlayerRunningError> {
         {
-            let mut state_lock = self.state.write();
+            let mut state_lock = self.state.write().unwrap();
             match *state_lock {
                 PlayerState::Playing | PlayerState::Paused => return Err(PlayerRunningError),
                 _ => {}
@@ -536,6 +556,7 @@ impl Player {
         let state = self.state.clone();
         let current = self.current.clone();
         let duration = self.time_playing.clone();
+        let volume = self.volume.clone();
 
         let (tx, rx) = mpsc::channel::<PlayerMessage>();
         self.sender = Some(tx);
@@ -549,11 +570,21 @@ impl Player {
             let stream_channels = stream_config.channels() as usize;
             // TODO: This might not work because of different channel amounts, idk how mp3 works
             let audio_stream = match stream_config.sample_format() {
-                SampleFormat::I16 => create_stream::<i16>(device, &stream_config.into(), consumer),
-                SampleFormat::I32 => create_stream::<i32>(device, &stream_config.into(), consumer),
-                SampleFormat::I64 => create_stream::<i64>(device, &stream_config.into(), consumer),
-                SampleFormat::F32 => create_stream::<f32>(device, &stream_config.into(), consumer),
-                SampleFormat::F64 => create_stream::<f64>(device, &stream_config.into(), consumer),
+                SampleFormat::I16 => {
+                    create_stream::<i16>(device, &stream_config.into(), consumer, volume)
+                }
+                SampleFormat::I32 => {
+                    create_stream::<i32>(device, &stream_config.into(), consumer, volume)
+                }
+                SampleFormat::I64 => {
+                    create_stream::<i64>(device, &stream_config.into(), consumer, volume)
+                }
+                SampleFormat::F32 => {
+                    create_stream::<f32>(device, &stream_config.into(), consumer, volume)
+                }
+                SampleFormat::F64 => {
+                    create_stream::<f64>(device, &stream_config.into(), consumer, volume)
+                }
                 sample_format => panic!("Unsupported sample format: '{sample_format}'"),
             }
             .unwrap();
@@ -565,16 +596,16 @@ impl Player {
                     let mut queue_lock = queue.lock().unwrap();
                     if let Some(song) = queue_lock.next() {
                         println!("Song found: {:?}", song.title);
-                        let mut current_lock = current.write();
+                        let mut current_lock = current.write().unwrap();
                         *current_lock = Some(song.clone());
                         // FIXME: Cloning is annoying
                         song.clone()
                     } else {
                         println!("Got none from Queue, exiting");
-                        let mut state_lock = state.write();
+                        let mut state_lock = state.write().unwrap();
                         *state_lock = PlayerState::Finished;
 
-                        let mut current_lock = current.write();
+                        let mut current_lock = current.write().unwrap();
                         *current_lock = None;
                         break;
                     }
@@ -594,14 +625,14 @@ impl Player {
                 let track_id = song.id;
                 // These use unwrap, so I'll need to refactor this
                 let mut format_reader = get_format_reader(mss);
-                let mut decoder = song.decoder();
+                let mut decoder = song.get_decoder();
                 println!("Created reader and decoder");
 
                 {
-                    let mut duration_lock = duration.write();
+                    let mut duration_lock = duration.write().unwrap();
                     *duration_lock = Default::default();
 
-                    let mut state_lock = state.write();
+                    let mut state_lock = state.write().unwrap();
                     *state_lock = PlayerState::Playing;
                 }
 
@@ -615,12 +646,12 @@ impl Player {
                                 break;
                             }
                             PlayerMessage::Pause => {
-                                let mut state_lock = state.write();
+                                let mut state_lock = state.write().unwrap();
                                 *state_lock = PlayerState::Paused;
                                 playing = false;
                             }
                             PlayerMessage::Resume => {
-                                let mut state_lock = state.write();
+                                let mut state_lock = state.write().unwrap();
                                 *state_lock = PlayerState::Playing;
                                 playing = true;
                             }
@@ -639,11 +670,11 @@ impl Player {
                                         },
                                     )
                                     .expect("Mp3 readers should always be seekable");
-                                let mut dur_lock = duration.write();
+                                let mut dur_lock = duration.write().unwrap();
                                 let time = time_base.calc_time(seeked_to.actual_ts);
                                 *dur_lock = time.into();
                                 // Reset the decoder after seeking, the docs say this is a necessary step
-                                decoder = song.decoder();
+                                decoder = song.get_decoder();
                             }
                         }
                     }
@@ -667,7 +698,7 @@ impl Player {
 
                         if let Ok(packet) = format_reader.next_packet() {
                             {
-                                let mut duration_lock = duration.write();
+                                let mut duration_lock = duration.write().unwrap();
                                 *duration_lock = time_base.calc_time(packet.ts()).into();
                             }
                             source_exhausted = false;
@@ -710,7 +741,7 @@ impl Player {
 }
 
 fn get_format_reader(mss: MediaSourceStream) -> Box<dyn FormatReader> {
-    // TODO: This should return a return instead of unwrapping
+    // TODO: This should return a result instead of unwrapping
     let probe = symphonia::default::get_probe();
     let mut hint = Hint::new();
     hint.with_extension("mp3");
@@ -744,15 +775,19 @@ fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
 fn write_audio<T: Sample>(
     data: &mut [T],
     samples: &mut impl Consumer<Item = SampleType>,
+    volume: &RwLock<f32>,
     _cbinfo: &cpal::OutputCallbackInfo,
 ) where
     T: cpal::FromSample<SampleType>,
 {
+    // Channel remapping might be done here, to lower the load on the Player thread
+    let volume = *volume.read().unwrap();
     for d in data.iter_mut() {
         // copy as many samples as we have.
         // if we run out, write silence
+        // TODO: volume controls here
         match samples.try_pop() {
-            Some(sample) => *d = T::from_sample(sample),
+            Some(sample) => *d = T::from_sample(((sample as f32) * volume) as SampleType),
             None => *d = T::from_sample(SampleType::EQUILIBRIUM),
         }
     }
@@ -763,14 +798,14 @@ fn create_stream<T>(
     device: cpal::Device,
     stream_config: &StreamConfig,
     mut consumer: (impl Consumer<Item = SampleType> + std::marker::Send + 'static),
+    volume: Arc<RwLock<f32>>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: SizedSample + cpal::FromSample<SampleType>,
 {
     let callback = move |data: &mut [T], cbinfo: &cpal::OutputCallbackInfo| {
-        write_audio(data, &mut consumer, cbinfo)
+        write_audio(data, &mut consumer, &volume, cbinfo)
     };
     let err_fn = |e| eprintln!("Stream error: {e}");
-    let stream = device.build_output_stream(stream_config, callback, err_fn, None)?;
-    Ok(stream)
+    device.build_output_stream(stream_config, callback, err_fn, None)
 }

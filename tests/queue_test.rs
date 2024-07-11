@@ -1,6 +1,4 @@
 use amuseing::player::{Queue, RepeatMode};
-use rand::prelude::SliceRandom;
-use rand::SeedableRng;
 
 #[test]
 fn test_iteration_single() {
@@ -90,19 +88,4 @@ fn test_jump() {
     q.next();
     q.jump(2);
     assert_eq!(Some(&3), q.peek());
-}
-
-#[test]
-fn test_shuffle() {
-    let items: Vec<u8> = vec![7, 1, 3, 4];
-    let mut q = Queue::new(items, 0, RepeatMode::All);
-    q.jump(1);
-    let seed = [3; 32];
-    let mut rng = rand::rngs::StdRng::from_seed(seed);
-    let remaining = &mut [7, 3, 4];
-    remaining.shuffle(&mut rng);
-
-    q.shuffle(&mut rng);
-    assert_eq!(Some(&1), q.next());
-    assert_eq!(Some(&remaining[0]), q.next());
 }
