@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Sample, SampleFormat, SizedSample, StreamConfig,
@@ -21,7 +21,7 @@ use symphonia::core::{
     audio::{AudioBuffer, Signal},
     codecs::{CodecParameters, Decoder},
     formats::{FormatOptions, FormatReader},
-    io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions},
+    io::{MediaSourceStream, MediaSourceStreamOptions},
     meta::MetadataOptions,
     probe::Hint,
     units,
@@ -42,16 +42,6 @@ pub enum RepeatMode {
     /// Iterate like a Vec, returning None after reaching the end.
     /// The `Queue` can still return elements after the end by skipping, jumping or changing the repeat mode.
     Off,
-}
-
-impl RepeatMode {
-    pub fn next(&self) -> Self {
-        match self {
-            Self::Off => Self::All,
-            Self::All => Self::Single,
-            Self::Single => Self::Off,
-        }
-    }
 }
 
 // A new queue is created everytime a different set of songs is loaded for the player,
@@ -178,7 +168,7 @@ impl<T> Queue<T> {
     }
 
     /// Return a mutable reference to the index.
-    /// NOTE: If you want iteration to work as expected, use `jump`.
+    /// NOTE: If you want iteration to work as expected, use `jump` or `skip`.
     pub fn index_mut(&mut self) -> &mut usize {
         &mut self.index
     }
@@ -516,7 +506,7 @@ impl Player {
         )
     }
 
-    /// Clamp the value to 0..1 and set the volume
+    /// Clamp the value to 0..1 and calculate the volume
     pub fn set_volume(&mut self, volume: &f32) {
         let mut volume_lock = self.volume.write().unwrap();
         const B: f32 = 6.9;
@@ -620,7 +610,6 @@ impl Player {
                     MediaSourceStream::new(Box::new(f), media_source_options)
                 };
                 println!("Created mss");
-                let seekable = mss.is_seekable();
                 let time_base = song.time_base();
                 let track_id = song.id;
                 // These use unwrap, so I'll need to refactor this
@@ -663,7 +652,7 @@ impl Player {
                                 // TODO: The bool `seekable` should be used to check if we can seek, I don't know how to handle that yet
                                 let seeked_to = format_reader
                                     .seek(
-                                        SeekMode::Accurate,
+                                        SeekMode::Coarse,
                                         SeekTo::Time {
                                             time,
                                             track_id: Some(track_id),
@@ -735,7 +724,6 @@ impl Player {
                 max: dur_max,
             });
         }
-        println!("Seeking to: {:.2}", duration.as_secs_f32());
         Ok(self.send_message(PlayerMessage::Seek(duration)))
     }
 }

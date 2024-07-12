@@ -1,9 +1,9 @@
-use std::{borrow::Borrow, time::Duration};
+use std::time::Duration;
 
 use amuseing::{player::Playlist, Player, Queue, RepeatMode};
 
 use eframe::{run_native, App};
-use egui::{Color32, Sense, ViewportBuilder, Widget};
+use egui::{Color32, Layout, Sense, ViewportBuilder, Widget};
 
 struct PlaylistButton {
     playlist_name: String,
@@ -174,10 +174,16 @@ impl<'a> Widget for &mut PlayerControls<'a> {
                 self.player.set_volume(self.volume);
             };
 
+            let mut queue_lock = self.player.queue().lock().unwrap();
+            let next = match queue_lock.repeat_mode {
+                RepeatMode::All => RepeatMode::Single,
+                RepeatMode::Single => RepeatMode::Off,
+                RepeatMode::Off => RepeatMode::All,
+            };
             if ui.button("🔁").clicked() {
-                let mut queue_lock = self.player.queue().lock().unwrap();
-                queue_lock.repeat_mode = queue_lock.repeat_mode.next();
+                queue_lock.repeat_mode = next;
             }
+            drop(queue_lock);
         })
         .response
     }
@@ -188,7 +194,6 @@ struct SongWidget<'a> {
     player: &'a mut Player,
     song: &'a amuseing::Song,
     id: usize,
-    height: Option<f32>,
 }
 
 impl<'a> SongWidget<'a> {
@@ -203,35 +208,28 @@ impl<'a> SongWidget<'a> {
             player,
             song,
             id,
-            height: None,
-        }
-    }
-
-    pub fn with_height(self, height: f32) -> Self {
-        Self {
-            height: Some(height),
-            ..self
         }
     }
 }
 
 impl<'a> Widget for &'a mut SongWidget<'a> {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
-        let frame = egui::Frame::none().fill(Color32::from_gray(50));
+        let frame = egui::Frame::none()
+            .fill(Color32::from_gray(50))
+            .inner_margin(egui::Margin::symmetric(10., 0.));
         frame
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                if let Some(height) = self.height {
-                    ui.set_height(height);
-                }
+                ui.set_height(ui.available_height());
                 ui.horizontal_centered(|ui| {
                     if ui.button("|>").clicked() {
-                        println!("Should play song: {}", self.song.title());
                         self.playlist.play_from_index(self.player, self.id)
                     }
                     ui.label(self.song.title());
-                    ui.label(self.song.duration().as_secs().to_string());
-                })
+                    ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format_time(&self.song.duration().as_secs()));
+                    });
+                });
             })
             .response
     }
@@ -269,28 +267,32 @@ impl Default for AmuseingApp {
 
 impl App for AmuseingApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let (content_width, content_height) = ctx.input(|i| {
+        let (window_width, window_height) = ctx.input(|i| {
             let viewport = i.viewport();
-            let rect = viewport.inner_rect.unwrap();
-            (rect.width(), rect.height())
+            let window_size = viewport.monitor_size.unwrap();
+            (window_size.x, window_size.y)
         });
 
         let _song_panel_height_ratio = 0.12;
-        let song_panel_min_height = content_height * 0.12;
-        let _song_panel_max_height = content_height * 1.;
+        let song_panel_height_min = window_height * 0.1;
+        let _song_panel_height_max = window_height * 1.;
 
         let playlist_panel_width_ratio = 0.2;
-        let playlist_panel_min_width = content_width * 0.1;
-        let playlist_panel_max_width = content_width * 1.;
+        let playlist_panel_width_min = window_width * 0.1;
+        let playlist_panel_width_max = window_width * 1.;
 
         let playlist_button_height_ratio = 0.15;
-        let min_playlist_button_height = content_height * 0.075;
-        let max_playlist_button_height = content_height * 1.;
+        let playlist_button_height_min = window_height * 0.055;
+        let playlist_button_height_max = window_height * 1.;
+
+        let song_widget_height_ratio = 0.1;
+        let song_widget_height_min = window_height * 0.045;
+        let song_widget_height_max = window_height * 1.;
 
         if let Some(song) = self.player.current() {
             // let song_panel_height = (content_size.height() * song_panel_height_ratio)
             //     .clamp(song_panel_min_height, song_panel_max_height);
-            let song_panel_height = song_panel_min_height;
+            let song_panel_height = song_panel_height_min;
             let song_panel = egui::TopBottomPanel::bottom("Song panel")
                 .exact_height(song_panel_height)
                 .resizable(false);
@@ -306,10 +308,10 @@ impl App for AmuseingApp {
             });
         }
 
-        let center_panel = egui::CentralPanel::default();
+        let center_panel = egui::CentralPanel::default().frame(egui::Frame::none());
         center_panel.show(ctx, |ui| {
             let playlist_panel_width = (ui.available_size().x * playlist_panel_width_ratio)
-                .clamp(playlist_panel_min_width, playlist_panel_max_width);
+                .clamp(playlist_panel_width_min, playlist_panel_width_max);
 
             let playlist_panel = egui::SidePanel::left("Playlist panel")
                 .exact_width(playlist_panel_width)
@@ -324,29 +326,36 @@ impl App for AmuseingApp {
                 scroll_area.show(ui, |ui| {
                     let mut size = ui.available_size();
                     size.y = (size.y * playlist_button_height_ratio)
-                        .clamp(min_playlist_button_height, max_playlist_button_height);
+                        .clamp(playlist_button_height_min, playlist_button_height_max);
                     draw_playlists(
                         ui,
                         &self.playlists,
                         &mut self.current_playlist_index,
-                        size,
                         &mut self.songs,
+                        size,
                     );
                 });
             });
-            if self.current_playlist_index < self.playlists.len() {
-                let playlist = &self.playlists[self.current_playlist_index];
-                let scroll_area = egui::ScrollArea::vertical()
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
-                scroll_area.show(ui, |ui| {
-                    draw_playlist_songs(&mut self.player, ui, playlist, &self.songs);
-                });
-            } else {
-                ui.centered_and_justified(|ui| {
-                    // TODO: Add button for creating new playlists or opening a folder
-                    ui.label("You have no playlists created")
-                });
-            }
+            let songs_panel = egui::CentralPanel::default().frame(egui::Frame::none());
+            songs_panel.show_inside(ui, |ui| {
+                if self.current_playlist_index < self.playlists.len() {
+                    let playlist = &self.playlists[self.current_playlist_index];
+                    let scroll_area = egui::ScrollArea::vertical().scroll_bar_visibility(
+                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                    );
+                    scroll_area.show(ui, |ui| {
+                        let mut size = ui.available_size();
+                        size.y = (size.y * song_widget_height_ratio)
+                            .clamp(song_widget_height_min, song_widget_height_max);
+                        draw_playlist_songs(&mut self.player, ui, playlist, &self.songs, size);
+                    });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        // TODO: Add button for creating new playlists or opening a folder
+                        ui.label("You have no playlists created")
+                    });
+                }
+            });
         });
     }
 }
@@ -356,11 +365,11 @@ fn draw_playlist_songs(
     ui: &mut egui::Ui,
     playlist: &Playlist,
     songs: &[amuseing::Song],
+    size: egui::Vec2,
 ) {
-    let height = ui.available_height() * 0.1;
     for (id, song) in songs.iter().enumerate() {
-        let song_widget = &mut SongWidget::new(playlist, player, song, id).with_height(height);
-        ui.add(song_widget);
+        let song_widget = &mut SongWidget::new(playlist, player, song, id);
+        ui.add_sized(size, song_widget);
     }
 }
 
@@ -368,8 +377,8 @@ fn draw_playlists(
     ui: &mut egui::Ui,
     playlists: &[Playlist],
     selected_id: &mut usize,
-    size: egui::Vec2,
     songs: &mut Vec<amuseing::Song>,
+    size: egui::Vec2,
 ) {
     for (i, playlist) in playlists.iter().enumerate() {
         let playlist_button =
