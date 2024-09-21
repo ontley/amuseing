@@ -208,6 +208,15 @@ impl<T> Queue<T> {
     }
 }
 
+impl<V, T> From<V> for Queue<T>
+where
+    V: Into<Vec<T>>,
+{
+    fn from(value: V) -> Self {
+        Self::new(value.into(), 0, RepeatMode::Off)
+    }
+}
+
 /// A representation of a song that can be played from `Player`.
 #[derive(Clone, Debug)]
 pub struct Song {
@@ -529,8 +538,6 @@ impl Player {
         let _ = self.run();
     }
 
-    // TODO: add result if already playing, currently we just panic
-    // unfortunately I can't make it move self, since I need the Player for the ui
     pub fn run(&mut self) -> Result<(), PlayerRunningError> {
         {
             let mut state_lock = self.state.write().unwrap();
@@ -540,7 +547,6 @@ impl Player {
             }
             *state_lock = PlayerState::Paused;
         }
-        println!("Running");
 
         let queue = self.queue.clone();
         let state = self.state.clone();
@@ -579,19 +585,16 @@ impl Player {
             }
             .unwrap();
             audio_stream.play().unwrap();
-            println!("Created audio stream");
 
             loop {
                 let song = {
                     let mut queue_lock = queue.lock().unwrap();
                     if let Some(song) = queue_lock.next() {
-                        println!("Song found: {:?}", song.title);
                         let mut current_lock = current.write().unwrap();
                         *current_lock = Some(song.clone());
                         // FIXME: Cloning is annoying
                         song.clone()
                     } else {
-                        println!("Got none from Queue, exiting");
                         let mut state_lock = state.write().unwrap();
                         *state_lock = PlayerState::Finished;
 
@@ -603,19 +606,16 @@ impl Player {
                 let channel_factor = stream_channels / song.params.channels.unwrap().count();
                 let mss = {
                     let Ok(f) = fs::File::open(&song.path) else {
-                        println!("Coudln't find the file for song: {}", song);
                         continue;
                     };
                     let media_source_options = MediaSourceStreamOptions::default();
                     MediaSourceStream::new(Box::new(f), media_source_options)
                 };
-                println!("Created mss");
                 let time_base = song.time_base();
                 let track_id = song.id;
                 // These use unwrap, so I'll need to refactor this
                 let mut format_reader = get_format_reader(mss);
                 let mut decoder = song.get_decoder();
-                println!("Created reader and decoder");
 
                 {
                     let mut duration_lock = duration.write().unwrap();
@@ -629,8 +629,8 @@ impl Player {
                 let mut source_exhausted = false;
                 let mut sample_deque: VecDeque<SampleType> = VecDeque::new();
                 while !source_exhausted || !producer.is_empty() {
-                    if let Ok(message) = rx.try_recv() {
-                        match message {
+                    match rx.try_recv() {
+                        Ok(message) => match message {
                             PlayerMessage::Stop => {
                                 break;
                             }
@@ -665,7 +665,10 @@ impl Player {
                                 // Reset the decoder after seeking, the docs say this is a necessary step
                                 decoder = song.get_decoder();
                             }
-                        }
+                        },
+                        // Break if the channel is disconnected, because this means the Player was dropped
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                        _ => (),
                     }
                     if !playing {
                         continue;

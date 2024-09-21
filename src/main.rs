@@ -125,7 +125,7 @@ impl<'a> Widget for &mut PlayerControls<'a> {
             //
             // Render the player buttons (rewind, pause/play, fast-forward)
             //
-            let main_controls_width = ui.available_width() * 0.15;
+            let main_controls_width = ui.available_height() * 3.;
             ui.allocate_ui(
                 egui::vec2(main_controls_width, ui.available_height()),
                 |ui| {
@@ -247,7 +247,7 @@ impl Default for AmuseingApp {
     fn default() -> Self {
         let playlists = vec![
             Playlist::new("Bruh 1".to_string(), "D:\\coding\\amuseing\\audio".into()).unwrap(),
-            Playlist::new("Bruh 2".to_string(), "D:\\coding\\amuseing\\audio".into()).unwrap(),
+            Playlist::new("Bruh 2".to_string(), "D:\\coding\\amuseing\\audio2".into()).unwrap(),
         ];
         let volume = 1.;
         let current_playlist_index = 0;
